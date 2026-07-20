@@ -4,6 +4,7 @@ import time
 import os
 import json
 import requests
+from collections import defaultdict
 from textblob import TextBlob
 from dotenv import load_dotenv
 
@@ -30,10 +31,14 @@ CACHE_FILE = os.path.join(OUTPUT_DIR, "tmdb_cache.json")
 
 STOP_WORDS = {"the", "and", "a", "to", "of", "in", "i", "is", "that", "it", "on", "you", "this", "for", "but", "with",
               "are", "have", "be", "at", "or", "as", "was", "so", "if", "out", "not", "my", "film", "movie"}
+MAX_ITERATIONS = 50000
 
+
+# ==========================================
+# PART 1: DATA AGGREGATION & TMDB FETCHING
+# ==========================================
 
 def load_cache():
-    # Load existing cache or initialize a fresh structure if it's the first run
     if os.path.exists(CACHE_FILE):
         try:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
@@ -44,7 +49,6 @@ def load_cache():
 
 
 def save_cache(cache_data):
-    # Save the dictionary back to disk as JSON
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(cache_data, f, indent=4)
 
@@ -83,7 +87,6 @@ def get_tmdb_genre_map(cache_data):
     if not TMDB_API_KEY:
         return {}
 
-    # Check if we already fetched and saved the genre map previously
     if cache_data.get("genre_map"):
         return cache_data["genre_map"]
 
@@ -92,8 +95,6 @@ def get_tmdb_genre_map(cache_data):
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         genres = response.json().get("genres", [])
-
-        # We need to convert the keys to strings because JSON dictionary keys must be strings
         genre_map = {str(genre["id"]): genre["name"] for genre in genres}
         cache_data["genre_map"] = genre_map
         return genre_map
@@ -103,7 +104,6 @@ def get_tmdb_genre_map(cache_data):
 
 
 def fetch_movie_genres(title, year, unique_key, genre_map, cache_data):
-    # Skip the network request entirely if we've looked this movie up before
     if unique_key in cache_data["movies"]:
         return cache_data["movies"][unique_key]
 
@@ -115,152 +115,275 @@ def fetch_movie_genres(title, year, unique_key, genre_map, cache_data):
 
         if results:
             genre_ids = results[0].get("genre_ids", [])
-            # Map the IDs to names, ensuring we check against string keys
             genre_names = [genre_map[str(gid)] for gid in genre_ids if str(gid) in genre_map]
             final_genres = ", ".join(genre_names)
-
-            # Save the result to our in-memory cache
             cache_data["movies"][unique_key] = final_genres
             return final_genres
 
     except requests.exceptions.RequestException:
         pass
 
-    # If the lookup fails or finds nothing, cache it as Unknown so we don't keep retrying it
     cache_data["movies"][unique_key] = "Unknown"
     return "Unknown"
 
 
-# Initialize our state
-movie_database = {}
-MAX_ITERATIONS = 50000
-api_cache = load_cache()
+def run_data_aggregation():
+    movie_database = {}
+    api_cache = load_cache()
 
-print("Aggregating and deduplicating data from inputs/ folder...")
+    print("Aggregating and deduplicating data from inputs/ folder...")
 
-# 1. Process diary
-try:
-    with open(DIARY_CSV, mode="r", encoding="utf-8") as infile:
-        reader = csv.DictReader(infile)
-        loop_count = 0
-        for row in reader:
-            if loop_count >= MAX_ITERATIONS: break
-            title = row.get("Name", "Unknown")
-            year = row.get("Year", "")
-            unique_key = f"{title}_{year}"
+    # 1. Process diary
+    try:
+        with open(DIARY_CSV, mode="r", encoding="utf-8") as infile:
+            reader = csv.DictReader(infile)
+            loop_count = 0
+            for row in reader:
+                if loop_count >= MAX_ITERATIONS: break
+                title = row.get("Name", "Unknown")
+                year = row.get("Year", "")
+                unique_key = f"{title}_{year}"
 
-            sentiment_label, keywords = process_text_data(row.get("Review", ""))
-            movie_database[unique_key] = {
-                "Title": title, "Year": year, "Status": "Watched",
-                "Rating": row.get("Rating", ""), "Sentiment": sentiment_label, "Keywords": keywords
-            }
-            loop_count += 1
-except FileNotFoundError:
-    print(f"Warning: {DIARY_CSV} not found.")
-
-# 2. Process reviews
-try:
-    with open(REVIEWS_CSV, mode="r", encoding="utf-8") as infile:
-        reader = csv.DictReader(infile)
-        loop_count = 0
-        for row in reader:
-            if loop_count >= MAX_ITERATIONS: break
-            title = row.get("Name", "Unknown")
-            year = row.get("Year", "")
-            unique_key = f"{title}_{year}"
-            review_text = row.get("Review", "")
-
-            if review_text.strip():
-                sentiment_label, keywords = process_text_data(review_text)
-                if unique_key in movie_database:
-                    movie_database[unique_key]["Sentiment"] = sentiment_label
-                    movie_database[unique_key]["Keywords"] = keywords
-                else:
-                    movie_database[unique_key] = {
-                        "Title": title, "Year": year, "Status": "Watched",
-                        "Rating": row.get("Rating", ""), "Sentiment": sentiment_label, "Keywords": keywords
-                    }
-            loop_count += 1
-except FileNotFoundError:
-    print(f"Warning: {REVIEWS_CSV} not found.")
-
-# 3. Process standalone ratings
-try:
-    with open(RATINGS_CSV, mode="r", encoding="utf-8") as infile:
-        reader = csv.DictReader(infile)
-        loop_count = 0
-        for row in reader:
-            if loop_count >= MAX_ITERATIONS: break
-            title = row.get("Name", "Unknown")
-            year = row.get("Year", "")
-            unique_key = f"{title}_{year}"
-
-            if unique_key not in movie_database:
+                sentiment_label, keywords = process_text_data(row.get("Review", ""))
                 movie_database[unique_key] = {
                     "Title": title, "Year": year, "Status": "Watched",
-                    "Rating": row.get("Rating", ""), "Sentiment": "No Review", "Keywords": ""
+                    "Rating": row.get("Rating", ""), "Sentiment": sentiment_label, "Keywords": keywords
                 }
-            loop_count += 1
-except FileNotFoundError:
-    print(f"Warning: {RATINGS_CSV} not found.")
+                loop_count += 1
+    except FileNotFoundError:
+        print(f"Warning: {DIARY_CSV} not found.")
 
-# 4. Process watchlist
-try:
-    with open(WATCHLIST_CSV, mode="r", encoding="utf-8") as infile:
-        reader = csv.DictReader(infile)
-        loop_count = 0
+    # 2. Process reviews
+    try:
+        with open(REVIEWS_CSV, mode="r", encoding="utf-8") as infile:
+            reader = csv.DictReader(infile)
+            loop_count = 0
+            for row in reader:
+                if loop_count >= MAX_ITERATIONS: break
+                title = row.get("Name", "Unknown")
+                year = row.get("Year", "")
+                unique_key = f"{title}_{year}"
+                review_text = row.get("Review", "")
+
+                if review_text.strip():
+                    sentiment_label, keywords = process_text_data(review_text)
+                    if unique_key in movie_database:
+                        movie_database[unique_key]["Sentiment"] = sentiment_label
+                        movie_database[unique_key]["Keywords"] = keywords
+                    else:
+                        movie_database[unique_key] = {
+                            "Title": title, "Year": year, "Status": "Watched",
+                            "Rating": row.get("Rating", ""), "Sentiment": sentiment_label, "Keywords": keywords
+                        }
+                loop_count += 1
+    except FileNotFoundError:
+        print(f"Warning: {REVIEWS_CSV} not found.")
+
+    # 3. Process standalone ratings
+    try:
+        with open(RATINGS_CSV, mode="r", encoding="utf-8") as infile:
+            reader = csv.DictReader(infile)
+            loop_count = 0
+            for row in reader:
+                if loop_count >= MAX_ITERATIONS: break
+                title = row.get("Name", "Unknown")
+                year = row.get("Year", "")
+                unique_key = f"{title}_{year}"
+
+                if unique_key not in movie_database:
+                    movie_database[unique_key] = {
+                        "Title": title, "Year": year, "Status": "Watched",
+                        "Rating": row.get("Rating", ""), "Sentiment": "No Review", "Keywords": ""
+                    }
+                loop_count += 1
+    except FileNotFoundError:
+        print(f"Warning: {RATINGS_CSV} not found.")
+
+    # 4. Process watchlist
+    try:
+        with open(WATCHLIST_CSV, mode="r", encoding="utf-8") as infile:
+            reader = csv.DictReader(infile)
+            loop_count = 0
+            for row in reader:
+                if loop_count >= MAX_ITERATIONS: break
+                title = row.get("Name", "Unknown")
+                year = row.get("Year", "")
+                unique_key = f"{title}_{year}"
+
+                if unique_key not in movie_database:
+                    movie_database[unique_key] = {
+                        "Title": title, "Year": year, "Status": "Watchlist",
+                        "Rating": "", "Sentiment": "", "Keywords": ""
+                    }
+                loop_count += 1
+    except FileNotFoundError:
+        print(f"Warning: {WATCHLIST_CSV} not found.")
+
+    genre_map = get_tmdb_genre_map(api_cache)
+
+    if movie_database:
+        print(f"Writing dataset to {OUTPUT_CSV}...")
+
+        with open(OUTPUT_CSV, mode="w", newline="", encoding="utf-8") as outfile:
+            fieldnames = ["Title", "Year", "Status", "Rating", "Sentiment", "Keywords", "Genres"]
+            writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+            writer.writeheader()
+
+            write_count = 0
+
+            for unique_key, row_data in movie_database.items():
+                if write_count >= (MAX_ITERATIONS * 4): break
+
+                if TMDB_API_KEY:
+                    genres = fetch_movie_genres(row_data["Title"], row_data["Year"], unique_key, genre_map, api_cache)
+                    row_data["Genres"] = genres
+                    time.sleep(0.01)
+                else:
+                    row_data["Genres"] = "No API Key"
+
+                writer.writerow(row_data)
+                write_count += 1
+
+                if write_count % 100 == 0:
+                    print(f"Processed {write_count} movies...")
+
+        save_cache(api_cache)
+        print(f"\n[Success] Export complete. Deduplicated {write_count} total unique movies.")
+        print("API cache updated.")
+    else:
+        print("\n[Error] No data found. Ensure the CSV files are inside the 'inputs' folder.")
+
+
+# ==========================================
+# PART 2: ANALYSIS
+# ==========================================
+
+def analyze_genre_preferences(filepath):
+    genre_totals = defaultdict(float)
+    genre_counts = defaultdict(int)
+
+    with open(filepath, mode="r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        row_count = 0
         for row in reader:
-            if loop_count >= MAX_ITERATIONS: break
-            title = row.get("Name", "Unknown")
-            year = row.get("Year", "")
-            unique_key = f"{title}_{year}"
+            if row_count >= MAX_ITERATIONS: break
+            row_count += 1
 
-            if unique_key not in movie_database:
-                movie_database[unique_key] = {
-                    "Title": title, "Year": year, "Status": "Watchlist",
-                    "Rating": "", "Sentiment": "", "Keywords": ""
-                }
-            loop_count += 1
-except FileNotFoundError:
-    print(f"Warning: {WATCHLIST_CSV} not found.")
+            if row.get("Status") == "Watched" and row.get("Rating"):
+                try:
+                    rating = float(row["Rating"])
+                except ValueError:
+                    continue
 
-# Fetch TMDB genre map (will load from cache if available)
-genre_map = get_tmdb_genre_map(api_cache)
+                genres = [g.strip() for g in row.get("Genres", "").split(",") if g.strip()]
 
-if movie_database:
-    print(f"Writing dataset to {OUTPUT_CSV}...")
+                genre_iterations = 0
+                for genre in genres:
+                    if genre_iterations >= 20: break
+                    genre_iterations += 1
 
-    with open(OUTPUT_CSV, mode="w", newline="", encoding="utf-8") as outfile:
-        fieldnames = ["Title", "Year", "Status", "Rating", "Sentiment", "Keywords", "Genres"]
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
+                    genre_totals[genre] += rating
+                    genre_counts[genre] += 1
 
-        write_count = 0
+    genre_averages = {}
+    dict_iterations = 0
+    for genre, total in genre_totals.items():
+        if dict_iterations >= 1000: break
+        dict_iterations += 1
+        if genre_counts[genre] >= 3:
+            genre_averages[genre] = round(total / genre_counts[genre], 2)
 
-        for unique_key, row_data in movie_database.items():
-            if write_count >= (MAX_ITERATIONS * 4): break
+    return dict(sorted(genre_averages.items(), key=lambda item: item[1], reverse=True))
 
-            if TMDB_API_KEY:
-                # Pass the unique_key and cache_data into the fetcher
-                genres = fetch_movie_genres(row_data["Title"], row_data["Year"], unique_key, genre_map, api_cache)
-                row_data["Genres"] = genres
 
-                # Only sleep if we actually made a network call (i.e. if it wasn't in cache initially)
-                # A quick hack to check if we just added it to the cache is beyond this scope, but
-                # sleeping 0.05 seconds even on cache hits won't hurt execution time significantly.
-                time.sleep(0.01)
-            else:
-                row_data["Genres"] = "No API Key"
+def analyze_decade_preferences(filepath):
+    decade_totals = defaultdict(float)
+    decade_counts = defaultdict(int)
 
-            writer.writerow(row_data)
-            write_count += 1
+    with open(filepath, mode="r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        row_count = 0
+        for row in reader:
+            if row_count >= MAX_ITERATIONS: break
+            row_count += 1
 
-            if write_count % 100 == 0:
-                print(f"Processed {write_count} movies...")
+            if row.get("Status") == "Watched" and row.get("Rating") and row.get("Year"):
+                try:
+                    rating = float(row["Rating"])
+                    year = int(row["Year"])
+                except ValueError:
+                    continue
 
-    # Save the cache file to disk once all lookups are complete
-    save_cache(api_cache)
-    print(f"Export complete. Deduplicated {write_count} total unique movies.")
-    print("API cache updated.")
-else:
-    print("No data found. Ensure the CSV files are inside the 'inputs' folder.")
+                decade = (year // 10) * 10
+                decade_totals[decade] += rating
+                decade_counts[decade] += 1
+
+    decade_averages = {}
+    dict_iterations = 0
+    for dec, total in decade_totals.items():
+        if dict_iterations >= 100: break
+        dict_iterations += 1
+        if decade_counts[dec] >= 3:
+            decade_averages[f"{dec}s"] = round(total / decade_counts[dec], 2)
+
+    return dict(sorted(decade_averages.items(), key=lambda item: item[1], reverse=True))
+
+
+def run_analysis():
+    if not os.path.exists(OUTPUT_CSV):
+        print(f"\n[Error] Could not find {OUTPUT_CSV}.")
+        print("Please run Option 1 (Build AI Profile) first so there is data to analyze.")
+        return
+
+    print(f"\nReading data from {OUTPUT_CSV}...")
+    genre_stats = analyze_genre_preferences(OUTPUT_CSV)
+    decade_stats = analyze_decade_preferences(OUTPUT_CSV)
+
+    print("\n==============================")
+    print("   YOUR MOVIE PREFERENCES     ")
+    print("==============================\n")
+
+    print("Top Genres by Average Rating (Min. 3 movies watched):")
+    genre_print_count = 0
+    for genre, avg in genre_stats.items():
+        if genre_print_count >= 5: break
+        if genre != "Unknown":  # Filter out failed API lookups from the rankings
+            print(f"  - {genre}: {avg}/5.0")
+            genre_print_count += 1
+
+    print("\nAverage Rating by Release Decade (Min. 3 movies watched):")
+    decade_print_count = 0
+    for decade, avg in decade_stats.items():
+        if decade_print_count >= 10: break
+        print(f"  - {decade}: {avg}/5.0")
+        decade_print_count += 1
+
+    print("\n==============================\n")
+
+
+# ==========================================
+# CLI INTERFACE
+# ==========================================
+
+def main():
+    while True:
+        print("\n--- Letterboxd AI Processing Tool ---")
+        print("1. Build AI Profile (Aggregate CSVs & Fetch TMDB Data)")
+        print("2. Run Local Analysis (Generate Stats Report)")
+        print("3. Exit")
+
+        choice = input("\nSelect an option (1-3): ").strip()
+
+        if choice == '1':
+            run_data_aggregation()
+        elif choice == '2':
+            run_analysis()
+        elif choice == '3':
+            print("Exiting. Goodbye!")
+            break
+        else:
+            print("Invalid selection. Please enter 1, 2, or 3.")
+
+
+if __name__ == "__main__":
+    main()
